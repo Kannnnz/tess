@@ -1,19 +1,30 @@
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import os
-import hashlib
+from typing import List, Optional, Dict, Any
 import sqlite3
-import requests
-import json
-from datetime import datetime, timedelta
-from typing import List, Optional
+import hashlib
 import jwt
+import os
+import uuid
+import json
+import requests
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
 import PyPDF2
-from docx import Document
-import io
-from admin_utils import *
+import docx
+from io import BytesIO
+
+# Security
+SECRET_KEY = "your-secret-key-change-this-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+security = HTTPBearer()
 
 app = FastAPI(title="Document Summarizer API", version="1.0.0")
 
@@ -26,32 +37,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Security
-security = HTTPBearer()
-SECRET_KEY = "your-secret-key-here-change-in-production"
-ALGORITHM = "HS256"
-
-# LM Studio configuration
-LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
-
 # Pydantic models
 class UserCreate(BaseModel):
     username: str
     password: str
-    email: Optional[str] = None
+    email: str  # Required untuk validasi domain UNNES
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: Optional[str]
+    role: str
+    created_at: str
+    is_active: bool
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_info: Dict[str, Any]
 
 class ChatMessage(BaseModel):
     message: str
     document_ids: Optional[List[str]] = []
+    session_id: Optional[str] = None
 
-class AdminUserCreate(BaseModel):
-    username: str
-    password: str
-    email: str
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+    message_id: int
 
-class UserRoleUpdate(BaseModel):
-    user_id: int
-    new_role: str
+class AdminUserUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    role: Optional[str] = None
 
 # Database functions
 def get_db_connection():
@@ -59,180 +76,225 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def get_user_by_username(username: str):
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    conn.close()
+    return user
+
+def get_user_by_id(user_id: int):
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+    conn.close()
+    return user
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def validate_unnes_email(email: str) -> str:
+    """Validate UNNES email and determine role"""
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    
+    email = email.lower().strip()
+    
+    if email.endswith("@students.unnes.ac.id"):
+        return "mahasiswa"
+    elif email.endswith("@mail.unnes.ac.id"):
+        return "dosen"
+    else:
+        raise HTTPException(
+            status_code=400, 
+            detail="Email harus menggunakan domain UNNES (@students.unnes.ac.id untuk mahasiswa atau @mail.unnes.ac.id untuk dosen)"
+        )
+
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=24)
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return payload
+        
+        user = get_user_by_username(username)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        return user
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def verify_admin_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    payload = verify_token(credentials)
-    if payload.get("role") != "admin":
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def get_admin_user(current_user = Depends(get_current_user)):
+    if current_user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
-    return payload
+    return current_user
 
-def authenticate_user(username: str, password: str):
-    conn = get_db_connection()
+# Text extraction functions
+def extract_text_from_pdf(file_content: bytes) -> str:
     try:
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        cursor = conn.execute(
-            "SELECT id, username, role, is_active FROM users WHERE username = ? AND password_hash = ?",
-            (username, password_hash)
-        )
-        user = cursor.fetchone()
-        if user and user["is_active"]:
-            # Update last login
-            conn.execute(
-                "UPDATE users SET last_login = ? WHERE id = ?",
-                (datetime.now().isoformat(), user["id"])
-            )
-            conn.commit()
-            return dict(user)
-        return None
-    finally:
-        conn.close()
+        pdf_file = BytesIO(file_content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error extracting PDF: {str(e)}")
 
-def is_question_relevant(question: str) -> bool:
-    """Check if question is relevant to paper/research or UNNES"""
-    paper_keywords = [
-        "paper", "penelitian", "skripsi", "jurnal", "artikel", "study", "metode", 
-        "hasil", "kesimpulan", "abstrak", "literatur", "referensi", "analisis",
-        "data", "sampel", "populasi", "hipotesis", "teori", "diskusi", "pembahasan"
-    ]
+def extract_text_from_docx(file_content: bytes) -> str:
+    try:
+        doc_file = BytesIO(file_content)
+        doc = docx.Document(doc_file)
+        text = ""
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        return text
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error extracting DOCX: {str(e)}")
+
+def extract_text_from_txt(file_content: bytes) -> str:
+    try:
+        return file_content.decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error extracting TXT: {str(e)}")
+
+def extract_text_from_file(file_content: bytes, filename: str) -> str:
+    file_extension = filename.lower().split('.')[-1]
     
-    unnes_keywords = [
-        "unnes", "universitas negeri semarang", "semarang", "kampus", "fakultas",
-        "jurusan", "program studi", "akademik", "mahasiswa", "dosen"
+    if file_extension == 'pdf':
+        return extract_text_from_pdf(file_content)
+    elif file_extension == 'docx':
+        return extract_text_from_docx(file_content)
+    elif file_extension == 'txt':
+        return extract_text_from_txt(file_content)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format")
+
+# LM Studio API function
+def query_lm_studio(prompt: str, context: str = "") -> str:
+    try:
+        full_prompt = f"""Context: {context}
+
+Question: {prompt}
+
+Please answer based on the provided context. If the question is not related to academic papers, research, or Universitas Negeri Semarang (UNNES), respond with: "Maaf, tolong berikan pertanyaan yang relevan dengan paper atau Universitas Negeri Semarang."
+
+Answer:"""
+
+        response = requests.post(
+            "http://127.0.0.1:1234/v1/chat/completions",
+            json={
+                "model": "mistral-nemo-instruct-2407",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant that answers questions about academic papers and Universitas Negeri Semarang (UNNES). Only answer questions related to these topics."},
+                    {"role": "user", "content": full_prompt}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1000
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        else:
+            return "Maaf, terjadi kesalahan dalam memproses pertanyaan Anda."
+            
+    except requests.exceptions.RequestException:
+        return "Maaf, tidak dapat terhubung ke AI model. Pastikan LM Studio berjalan."
+
+def is_relevant_question(question: str) -> bool:
+    """Check if question is relevant to papers or UNNES"""
+    relevant_keywords = [
+        'paper', 'penelitian', 'skripsi', 'jurnal', 'artikel', 'study', 'research',
+        'unnes', 'universitas negeri semarang', 'semarang', 'metode', 'metodologi',
+        'hasil', 'kesimpulan', 'analisis', 'pembahasan', 'teori', 'landasan',
+        'penulis', 'author', 'tahun', 'publikasi', 'abstrak', 'abstract'
     ]
     
     question_lower = question.lower()
-    
-    # Check for paper/research keywords
-    for keyword in paper_keywords:
-        if keyword in question_lower:
-            return True
-    
-    # Check for UNNES keywords
-    for keyword in unnes_keywords:
-        if keyword in question_lower:
-            return True
-    
-    return False
+    return any(keyword in question_lower for keyword in relevant_keywords)
 
-def extract_text_from_file(file_content: bytes, filename: str) -> str:
-    """Extract text from uploaded file"""
-    try:
-        if filename.endswith('.pdf'):
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            return text
-        
-        elif filename.endswith('.docx'):
-            doc = Document(io.BytesIO(file_content))
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            return text
-        
-        elif filename.endswith('.txt'):
-            return file_content.decode('utf-8')
-        
-        else:
-            return ""
-    
-    except Exception as e:
-        print(f"Error extracting text from {filename}: {str(e)}")
-        return ""
+# API Endpoints
 
-def call_lm_studio(prompt: str) -> str:
-    """Call LM Studio API"""
-    try:
-        payload = {
-            "model": "mistral-nemo-instruct-2407",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Anda adalah asisten AI yang membantu menganalisis dokumen penelitian dan menjawab pertanyaan tentang Universitas Negeri Semarang (UNNES). Berikan jawaban yang akurat, relevan, dan berdasarkan konten dokumen yang diberikan."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.7,
-            "max_tokens": 1000
-        }
-        
-        response = requests.post(LM_STUDIO_URL, json=payload, timeout=30)
-        
-        if response.status_code == 200:
-            result = response.json()
-            return result['choices'][0]['message']['content']
-        else:
-            return "Maaf, terjadi kesalahan pada sistem AI. Silakan coba lagi."
-    
-    except Exception as e:
-        print(f"Error calling LM Studio: {str(e)}")
-        return "Maaf, sistem AI sedang tidak tersedia. Silakan coba lagi nanti."
-
-# User endpoints
-@app.post("/register")
+@app.post("/register", response_model=dict)
 async def register(user: UserCreate):
+    # Validate UNNES email and get role
+    role = validate_unnes_email(user.email)
+    
+    # Check if username already exists
+    if get_user_by_username(user.username):
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # Check if email already exists
     conn = get_db_connection()
-    try:
-        # Check if user exists
-        cursor = conn.execute("SELECT id FROM users WHERE username = ?", (user.username,))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Username already registered")
-        
-        # Hash password
-        password_hash = hashlib.sha256(user.password.encode()).hexdigest()
-        
-        # Create user
-        conn.execute("""
-            INSERT INTO users (username, password_hash, email, role, is_active, created_at)
-            VALUES (?, ?, ?, 'user', 1, ?)
-        """, (user.username, password_hash, user.email, datetime.now().isoformat()))
-        
-        conn.commit()
-        return {"message": "User registered successfully"}
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
-    finally:
+    existing_email = conn.execute('SELECT id FROM users WHERE email = ?', (user.email.lower(),)).fetchone()
+    if existing_email:
         conn.close()
-
-@app.post("/token")
-async def login(username: str = Form(...), password: str = Form(...)):
-    user = authenticate_user(username, password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
-        )
+        raise HTTPException(status_code=400, detail="Email already registered")
     
-    access_token = create_access_token(
-        data={"sub": user["username"], "role": user["role"], "user_id": user["id"]}
-    )
-    return {"access_token": access_token, "token_type": "bearer", "role": user["role"]}
+    # Hash password
+    hashed_password = get_password_hash(user.password)
+    
+    # Insert user with determined role
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO users (username, password_hash, email, role) VALUES (?, ?, ?, ?)',
+            (user.username, hashed_password, user.email.lower(), role)
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
+        conn.close()
+        
+        return {
+            "message": "User registered successfully", 
+            "user_id": user_id,
+            "role": role,
+            "email": user.email.lower()
+        }
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = get_user_by_username(form_data.username)
+    
+    if not user or not verify_password(form_data.password, user['password_hash']):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    if not user['is_active']:
+        raise HTTPException(status_code=401, detail="Account is deactivated")
+    
+    access_token = create_access_token(data={"sub": user['username']})
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_info": {
+            "id": user['id'],
+            "username": user['username'],
+            "email": user['email'],
+            "role": user['role']
+        }
+    }
 
 @app.post("/upload")
-async def upload_documents(files: List[UploadFile] = File(...), current_user: dict = Depends(verify_token)):
+async def upload_documents(
+    files: List[UploadFile] = File(...),
+    current_user = Depends(get_current_user)
+):
     if len(files) > 5:
         raise HTTPException(status_code=400, detail="Maximum 5 files allowed")
     
@@ -241,234 +303,316 @@ async def upload_documents(files: List[UploadFile] = File(...), current_user: di
     
     try:
         for file in files:
-            if not file.filename.endswith(('.pdf', '.docx', '.txt')):
-                raise HTTPException(status_code=400, detail=f"File type not supported: {file.filename}")
+            # Read file content
+            file_content = await file.read()
             
-            # Create uploads directory if not exists
-            os.makedirs("uploads", exist_ok=True)
+            # Extract text
+            extracted_text = extract_text_from_file(file_content, file.filename)
+            
+            # Generate unique document ID
+            doc_id = str(uuid.uuid4())
             
             # Save file
-            file_path = f"uploads/{current_user['user_id']}_{file.filename}"
-            with open(file_path, "wb") as buffer:
-                content = await file.read()
-                buffer.write(content)
+            file_path = f"uploads/{doc_id}_{file.filename}"
+            with open(file_path, "wb") as f:
+                f.write(file_content)
             
             # Save to database
-            conn.execute("""
-                INSERT INTO documents (user_id, filename, file_path, uploaded_at)
-                VALUES (?, ?, ?, ?)
-            """, (current_user["user_id"], file.filename, file_path, datetime.now().isoformat()))
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO documents (id, user_id, filename, file_path, file_size, content_text)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (doc_id, current_user['id'], file.filename, file_path, len(file_content), extracted_text))
             
-            uploaded_files.append({"filename": file.filename, "file_path": file_path})
+            uploaded_files.append({
+                "document_id": doc_id,
+                "filename": file.filename,
+                "size": len(file_content)
+            })
         
         conn.commit()
-        return {"message": f"{len(uploaded_files)} files uploaded successfully", "files": uploaded_files}
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-    finally:
         conn.close()
+        
+        return {"message": "Files uploaded successfully", "documents": uploaded_files}
+        
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@app.post("/chat")
-async def chat(message: ChatMessage, current_user: dict = Depends(verify_token)):
-    # Check question relevance
-    if not is_question_relevant(message.message):
-        response_text = "Maaf, tolong berikan pertanyaan yang relevan dengan paper atau universitas negeri semarang"
-        
-        # Save to chat history
-        conn = get_db_connection()
-        try:
-            conn.execute("""
-                INSERT INTO chat_history (user_id, message, response, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (current_user["user_id"], message.message, response_text, datetime.now().isoformat()))
-            conn.commit()
-        finally:
-            conn.close()
-        
-        return {"response": response_text}
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    chat_request: ChatMessage,
+    current_user = Depends(get_current_user)
+):
+    # Check if question is relevant
+    if not is_relevant_question(chat_request.message):
+        return ChatResponse(
+            response="Maaf, tolong berikan pertanyaan yang relevan dengan paper atau Universitas Negeri Semarang.",
+            session_id=chat_request.session_id or str(uuid.uuid4()),
+            message_id=0
+        )
     
-    # Get documents content
-    documents_content = ""
-    if message.document_ids:
+    # Get document context
+    context = ""
+    if chat_request.document_ids:
         conn = get_db_connection()
-        try:
-            for doc_id in message.document_ids:
-                cursor = conn.execute(
-                    "SELECT file_path, filename FROM documents WHERE id = ? AND user_id = ?",
-                    (doc_id, current_user["user_id"])
-                )
-                doc = cursor.fetchone()
-                
-                if doc:
-                    with open(doc["file_path"], "rb") as f:
-                        file_content = f.read()
-                    
-                    text = extract_text_from_file(file_content, doc["filename"])
-                    documents_content += f"\n--- {doc['filename']} ---\n{text}\n"
-        finally:
-            conn.close()
-    
-    # Prepare prompt
-    if documents_content:
-        prompt = f"""
-        Berdasarkan dokumen berikut:
-        {documents_content}
-        
-        Pertanyaan: {message.message}
-        
-        Tolong berikan jawaban yang akurat berdasarkan konten dokumen di atas.
-        """
-    else:
-        prompt = f"""
-        Pertanyaan tentang penelitian/paper atau Universitas Negeri Semarang: {message.message}
-        
-        Berikan jawaban yang informatif dan akurat.
-        """
+        for doc_id in chat_request.document_ids:
+            doc = conn.execute(
+                'SELECT content_text FROM documents WHERE id = ? AND user_id = ?',
+                (doc_id, current_user['id'])
+            ).fetchone()
+            if doc:
+                context += doc['content_text'] + "\n\n"
+        conn.close()
     
     # Get AI response
-    ai_response = call_lm_studio(prompt)
+    ai_response = query_lm_studio(chat_request.message, context)
     
-    # Save to chat history
-    conn = get_db_connection()
-    try:
-        conn.execute("""
-            INSERT INTO chat_history (user_id, message, response, timestamp)
-            VALUES (?, ?, ?, ?)
-        """, (current_user["user_id"], message.message, ai_response, datetime.now().isoformat()))
-        conn.commit()
-    finally:
-        conn.close()
+    # Create or use existing session
+    session_id = chat_request.session_id or str(uuid.uuid4())
     
-    return {"response": ai_response}
-
-@app.get("/chat/history")
-async def get_chat_history(current_user: dict = Depends(verify_token)):
+    # Save chat message
     conn = get_db_connection()
-    try:
-        cursor = conn.execute("""
-            SELECT message, response, timestamp
-            FROM chat_history
-            WHERE user_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 20
-        """, (current_user["user_id"],))
-        
-        history = []
-        for row in cursor.fetchall():
-            history.append({
-                "message": row["message"],
-                "response": row["response"],
-                "timestamp": row["timestamp"]
-            })
-        
-        return {"history": history}
-    finally:
-        conn.close()
+    cursor = conn.cursor()
+    
+    # Create session if new
+    if not chat_request.session_id:
+        cursor.execute(
+            'INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)',
+            (session_id, current_user['id'], chat_request.message[:50] + "...")
+        )
+    
+    # Save message
+    cursor.execute('''
+        INSERT INTO chat_messages (session_id, user_id, message, response, document_ids)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (session_id, current_user['id'], chat_request.message, ai_response, 
+          json.dumps(chat_request.document_ids) if chat_request.document_ids else None))
+    
+    message_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return ChatResponse(
+        response=ai_response,
+        session_id=session_id,
+        message_id=message_id
+    )
 
 @app.get("/documents")
-async def get_user_documents(current_user: dict = Depends(verify_token)):
+async def get_user_documents(current_user = Depends(get_current_user)):
     conn = get_db_connection()
-    try:
-        cursor = conn.execute("""
-            SELECT id, filename, uploaded_at
-            FROM documents
-            WHERE user_id = ?
-            ORDER BY uploaded_at DESC
-        """, (current_user["user_id"],))
+    documents = conn.execute('''
+        SELECT id, filename, file_size, upload_date 
+        FROM documents 
+        WHERE user_id = ? 
+        ORDER BY upload_date DESC
+    ''', (current_user['id'],)).fetchall()
+    conn.close()
+    
+    return [dict(doc) for doc in documents]
+
+@app.get("/chat-history")
+async def get_chat_history(current_user = Depends(get_current_user)):
+    conn = get_db_connection()
+    sessions = conn.execute('''
+        SELECT id, title, created_at 
+        FROM chat_sessions 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC
+    ''', (current_user['id'],)).fetchall()
+    conn.close()
+    
+    return [dict(session) for session in sessions]
+
+@app.get("/chat-messages/{session_id}")
+async def get_chat_messages(session_id: str, current_user = Depends(get_current_user)):
+    conn = get_db_connection()
+    messages = conn.execute('''
+        SELECT message, response, timestamp 
+        FROM chat_messages 
+        WHERE session_id = ? AND user_id = ? 
+        ORDER BY timestamp ASC
+    ''', (session_id, current_user['id'])).fetchall()
+    conn.close()
+    
+    return [dict(message) for message in messages]
+
+# Admin endpoints (Only Admin)
+@app.get("/admin/users", response_model=List[UserResponse])
+async def get_all_users(admin_user = Depends(get_admin_user)):
+    conn = get_db_connection()
+    users = conn.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
+    conn.close()
+    
+    return [UserResponse(**dict(user)) for user in users]
+
+# Dosen can also view users (but limited actions)
+@app.get("/dosen/users", response_model=List[UserResponse])
+async def get_users_for_dosen(dosen_user = Depends(get_admin_or_dosen_user)):
+    conn = get_db_connection()
+    # Dosen can only see mahasiswa
+    if dosen_user['role'] == 'dosen':
+        users = conn.execute('SELECT * FROM users WHERE role = "mahasiswa" ORDER BY created_at DESC').fetchall()
+    else:  # admin
+        users = conn.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
+    conn.close()
+    
+    return [UserResponse(**dict(user)) for user in users]
+
+@app.put("/admin/users/{user_id}")
+async def update_user(
+    user_id: int,
+    update_data: AdminUserUpdate,
+    admin_user = Depends(get_admin_user)
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Build update query dynamically
+    updates = []
+    params = []
+    
+    if update_data.is_active is not None:
+        updates.append("is_active = ?")
+        params.append(update_data.is_active)
+    
+    if update_data.role is not None:
+        updates.append("role = ?")
+        params.append(update_data.role)
+    
+    if updates:
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+        params.append(user_id)
+        cursor.execute(query, params)
         
-        documents = []
-        for row in cursor.fetchall():
-            documents.append({
-                "id": row["id"],
-                "filename": row["filename"],
-                "uploaded_at": row["uploaded_at"]
-            })
+        # Log admin action
+        cursor.execute('''
+            INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+            VALUES (?, ?, ?, ?)
+        ''', (admin_user['id'], "UPDATE_USER", user_id, json.dumps(update_data.dict())))
         
-        return {"documents": documents}
-    finally:
-        conn.close()
-
-# Admin endpoints
-@app.post("/admin/create-admin")
-async def create_admin_endpoint(admin_data: AdminUserCreate, current_user: dict = Depends(verify_admin_token)):
-    result = create_admin_user(admin_data.username, admin_data.password, admin_data.email)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
-
-@app.get("/admin/users")
-async def get_all_users_endpoint(current_user: dict = Depends(verify_admin_token)):
-    users = get_all_users()
-    return {"users": users}
-
-@app.post("/admin/users/{user_id}/toggle-status")
-async def toggle_user_status_endpoint(user_id: int, current_user: dict = Depends(verify_admin_token)):
-    result = toggle_user_status(user_id)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
+        conn.commit()
+    
+    conn.close()
+    return {"message": "User updated successfully"}
 
 @app.delete("/admin/users/{user_id}")
-async def delete_user_endpoint(user_id: int, current_user: dict = Depends(verify_admin_token)):
-    result = delete_user(user_id)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
+async def delete_user(user_id: int, admin_user = Depends(get_admin_user)):
+    if user_id == admin_user['id']:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Delete user and related data
+    cursor.execute('DELETE FROM chat_messages WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM chat_sessions WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM documents WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+    
+    # Log admin action
+    cursor.execute('''
+        INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+        VALUES (?, ?, ?, ?)
+    ''', (admin_user['id'], "DELETE_USER", user_id, f"Deleted user ID {user_id}"))
+    
+    conn.commit()
+    conn.close()
+    
+    return {"message": "User deleted successfully"}
 
 @app.get("/admin/stats")
-async def get_system_stats_endpoint(current_user: dict = Depends(verify_admin_token)):
-    stats = get_system_stats()
-    return {"stats": stats}
-
-@app.get("/admin/documents")
-async def get_all_documents_endpoint(current_user: dict = Depends(verify_admin_token)):
-    documents = get_all_documents()
-    return {"documents": documents}
-
-@app.delete("/admin/documents/{doc_id}")
-async def delete_document_endpoint(doc_id: int, current_user: dict = Depends(verify_admin_token)):
-    result = delete_document(doc_id)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
-
-@app.get("/admin/chats")
-async def get_all_chats_endpoint(current_user: dict = Depends(verify_admin_token)):
-    chats = get_chat_history_all()
-    return {"chats": chats}
-
-@app.post("/admin/cleanup")
-async def cleanup_old_data_endpoint(days: int = 30, current_user: dict = Depends(verify_admin_token)):
-    result = cleanup_old_data(days)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
-
-@app.post("/admin/users/change-role")
-async def change_user_role_endpoint(role_update: UserRoleUpdate, current_user: dict = Depends(verify_admin_token)):
-    result = change_user_role(role_update.user_id, role_update.new_role)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
-
-@app.post("/admin/users/{user_id}/reset-password")
-async def reset_user_password_endpoint(user_id: int, current_user: dict = Depends(verify_admin_token)):
-    result = reset_user_password(user_id)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    return result
-
-@app.get("/")
-async def root():
+async def get_admin_stats(admin_user = Depends(get_admin_user)):
+    conn = get_db_connection()
+    
+    # Get various statistics
+    total_users = conn.execute('SELECT COUNT(*) as count FROM users').fetchone()['count']
+    total_mahasiswa = conn.execute('SELECT COUNT(*) as count FROM users WHERE role = "mahasiswa"').fetchone()['count']
+    total_dosen = conn.execute('SELECT COUNT(*) as count FROM users WHERE role = "dosen"').fetchone()['count']
+    total_documents = conn.execute('SELECT COUNT(*) as count FROM documents').fetchone()['count']
+    total_chats = conn.execute('SELECT COUNT(*) as count FROM chat_messages').fetchone()['count']
+    active_users = conn.execute('SELECT COUNT(*) as count FROM users WHERE is_active = 1').fetchone()['count']
+    
+    conn.close()
+    
     return {
-        "message": "Document Summarizer API",
-        "version": "1.0.0",
-        "endpoints": {
-            "user": ["/register", "/token", "/upload", "/chat", "/chat/history", "/documents"],
-            "admin": ["/admin/users", "/admin/stats", "/admin/documents", "/admin/chats", "/admin/cleanup"]
+        "total_users": total_users,
+        "total_mahasiswa": total_mahasiswa,
+        "total_dosen": total_dosen,
+        "active_users": active_users,
+        "total_documents": total_documents,
+        "total_chat_messages": total_chats
+    }
+
+@app.get("/predefined-questions")
+async def get_predefined_questions():
+    """Get list of predefined questions"""
+    questions = [
+        "Apa metode penelitian yang digunakan dalam paper ini?",
+        "Siapa penulis dan kapan paper ini dibuat?",
+        "Apa hasil utama dari penelitian ini?",
+        "Apa kesimpulan dari paper ini?",
+        "Apa landasan teori yang digunakan?",
+        "Bagaimana metodologi yang diterapkan?",
+        "Apa saja temuan penting dalam penelitian ini?",
+        "Bagaimana analisis data dilakukan?",
+        "Apa kontribusi penelitian ini terhadap ilmu pengetahuan?",
+        "Apa saran untuk penelitian selanjutnya?",
+        "Bagaimana cara mendaftar di UNNES?",
+        "Apa saja fakultas yang ada di UNNES?",
+        "Bagaimana sistem perkuliahan di UNNES?",
+        "Apa visi misi UNNES?"
+    ]
+    return {"questions": questions}
+
+@app.get("/profile")
+async def get_user_profile(current_user = Depends(get_current_user)):
+    """Get current user profile information"""
+    return {
+        "id": current_user['id'],
+        "username": current_user['username'],
+        "email": current_user['email'],
+        "role": current_user['role'],
+        "created_at": current_user['created_at'],
+        "is_active": current_user['is_active']
+    }
+
+@app.get("/role-info")
+async def get_role_info():
+    """Get information about different roles in the system"""
+    return {
+        "roles": {
+            "mahasiswa": {
+                "description": "Mahasiswa UNNES",
+                "email_domain": "@students.unnes.ac.id",
+                "permissions": [
+                    "Upload dokumen penelitian",
+                    "Chat dengan AI tentang paper/UNNES", 
+                    "Melihat riwayat chat sendiri",
+                    "Mengelola dokumen sendiri"
+                ]
+            },
+            "dosen": {
+                "description": "Dosen UNNES",
+                "email_domain": "@mail.unnes.ac.id", 
+                "permissions": [
+                    "Semua fitur mahasiswa",
+                    "Melihat daftar mahasiswa",
+                    "Akses ke statistik terbatas"
+                ]
+            },
+            "admin": {
+                "description": "Administrator Sistem",
+                "email_domain": "@mail.unnes.ac.id",
+                "permissions": [
+                    "Semua fitur sistem",
+                    "Mengelola semua user",
+                    "Melihat statistik lengkap",
+                    "Mengaktifkan/menonaktifkan akun",
+                    "Menghapus user dan data"
+                ]
+            }
         }
     }
 
