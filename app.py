@@ -1,621 +1,566 @@
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import sqlite3
-import hashlib
-import jwt
+from flask import Flask, request, jsonify, session, render_template
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 import os
-import uuid
-import json
+from datetime import datetime
 import requests
-from datetime import datetime, timedelta
-from passlib.context import CryptContext
 import PyPDF2
-import docx
-from io import BytesIO
+from docx import Document
+import io
+import json
+from functools import wraps
 
-# Security
-SECRET_KEY = "your-secret-key-change-this-in-production"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///document_summarizer.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-security = HTTPBearer()
+# Ensure upload directory exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-app = FastAPI(title="Document Summarizer API", version="1.0.0")
+db = SQLAlchemy(app)
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Pydantic models
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    email: str  # Required untuk validasi domain UNNES
-
-class UserResponse(BaseModel):
-    id: int
-    username: str
-    email: Optional[str]
-    role: str
-    created_at: str
-    is_active: bool
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user_info: Dict[str, Any]
-
-class ChatMessage(BaseModel):
-    message: str
-    document_ids: Optional[List[str]] = []
-    session_id: Optional[str] = None
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-    message_id: int
-
-class AdminUserUpdate(BaseModel):
-    is_active: Optional[bool] = None
-    role: Optional[str] = None
-
-# Database functions
-def get_db_connection():
-    conn = sqlite3.connect('database.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def get_user_by_username(username: str):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-    conn.close()
-    return user
-
-def get_user_by_id(user_id: int):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-    conn.close()
-    return user
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-def validate_unnes_email(email: str) -> str:
-    """Validate UNNES email and determine role"""
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    role = db.Column(db.String(20), default='user')  # 'user', 'admin', 'dosen'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
-    email = email.lower().strip()
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
     
-    if email.endswith("@students.unnes.ac.id"):
-        return "mahasiswa"
-    elif email.endswith("@mail.unnes.ac.id"):
-        return "dosen"
-    else:
-        raise HTTPException(
-            status_code=400, 
-            detail="Email harus menggunakan domain UNNES (@students.unnes.ac.id untuk mahasiswa atau @mail.unnes.ac.id untuk dosen)"
-        )
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
 
-def create_access_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+class Document(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    file_path = db.Column(db.String(500), nullable=False)
+    content = db.Column(db.Text)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+class ChatHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    session_id = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    response = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    document_ids = db.Column(db.String(500))  # Store as comma-separated IDs
+
+# LM Studio Configuration
+LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+
+# Allowed file extensions
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'doc', 'docx'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Authentication decorators
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Authentication required'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Authentication required'}), 401
         
-        user = get_user_by_username(username)
-        if user is None:
-            raise HTTPException(status_code=401, detail="User not found")
-        
+        user = User.query.get(session['user_id'])
+        if not user or user.role != 'admin':
+            return jsonify({'error': 'Admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+def get_admin_or_dosen_user():
+    """Helper function to get current user if they are admin or dosen"""
+    if 'user_id' not in session:
+        return None
+    
+    user = User.query.get(session['user_id'])
+    if user and user.role in ['admin', 'dosen']:
         return user
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    return None
 
-def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+def admin_or_dosen_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_admin_or_dosen_user()
+        if not user:
+            return jsonify({'error': 'Admin or Dosen access required'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
 
-def get_admin_user(current_user = Depends(get_current_user)):
-    if current_user['role'] != 'admin':
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return current_user
-
-# Text extraction functions
-def extract_text_from_pdf(file_content: bytes) -> str:
+# File processing functions
+def extract_text_from_pdf(file_path):
+    text = ""
     try:
-        pdf_file = BytesIO(file_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                text += page.extract_text()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error extracting PDF: {str(e)}")
+        print(f"Error extracting PDF: {e}")
+    return text
 
-def extract_text_from_docx(file_content: bytes) -> str:
+def extract_text_from_docx(file_path):
+    text = ""
     try:
-        doc_file = BytesIO(file_content)
-        doc = docx.Document(doc_file)
-        text = ""
+        doc = Document(file_path)
         for paragraph in doc.paragraphs:
             text += paragraph.text + "\n"
-        return text
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error extracting DOCX: {str(e)}")
+        print(f"Error extracting DOCX: {e}")
+    return text
 
-def extract_text_from_txt(file_content: bytes) -> str:
+def extract_text_from_txt(file_path):
+    text = ""
     try:
-        return file_content.decode('utf-8')
+        with open(file_path, 'r', encoding='utf-8') as file:
+            text = file.read()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error extracting TXT: {str(e)}")
+        print(f"Error extracting TXT: {e}")
+    return text
 
-def extract_text_from_file(file_content: bytes, filename: str) -> str:
-    file_extension = filename.lower().split('.')[-1]
+def extract_text_from_file(file_path, filename):
+    """Extract text based on file extension"""
+    ext = filename.rsplit('.', 1)[1].lower()
     
-    if file_extension == 'pdf':
-        return extract_text_from_pdf(file_content)
-    elif file_extension == 'docx':
-        return extract_text_from_docx(file_content)
-    elif file_extension == 'txt':
-        return extract_text_from_txt(file_content)
+    if ext == 'pdf':
+        return extract_text_from_pdf(file_path)
+    elif ext in ['doc', 'docx']:
+        return extract_text_from_docx(file_path)
+    elif ext == 'txt':
+        return extract_text_from_txt(file_path)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file format")
+        return ""
 
-# LM Studio API function
-def query_lm_studio(prompt: str, context: str = "") -> str:
+def is_relevant_query(query):
+    """Check if query is relevant to papers or UNNES"""
+    query_lower = query.lower()
+    paper_keywords = ['paper', 'skripsi', 'penelitian', 'jurnal', 'artikel', 'studi', 'analisis', 'metode', 'hasil', 'kesimpulan', 'abstrak', 'penulis', 'author']
+    unnes_keywords = ['unnes', 'universitas negeri semarang', 'semarang', 'negeri semarang']
+    
+    # Check if query contains paper-related keywords
+    for keyword in paper_keywords:
+        if keyword in query_lower:
+            return True
+    
+    # Check if query contains UNNES-related keywords
+    for keyword in unnes_keywords:
+        if keyword in query_lower:
+            return True
+    
+    return False
+
+def query_lm_studio(messages, max_tokens=1000):
+    """Query LM Studio API"""
     try:
-        full_prompt = f"""Context: {context}
-
-Question: {prompt}
-
-Please answer based on the provided context. If the question is not related to academic papers, research, or Universitas Negeri Semarang (UNNES), respond with: "Maaf, tolong berikan pertanyaan yang relevan dengan paper atau Universitas Negeri Semarang."
-
-Answer:"""
-
-        response = requests.post(
-            "http://127.0.0.1:1234/v1/chat/completions",
-            json={
-                "model": "mistral-nemo-instruct-2407",
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant that answers questions about academic papers and Universitas Negeri Semarang (UNNES). Only answer questions related to these topics."},
-                    {"role": "user", "content": full_prompt}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 1000
-            },
-            timeout=30
-        )
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "local-model",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.7
+        }
+        
+        response = requests.post(LM_STUDIO_URL, headers=headers, json=data, timeout=30)
         
         if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
+            result = response.json()
+            return result['choices'][0]['message']['content']
         else:
-            return "Maaf, terjadi kesalahan dalam memproses pertanyaan Anda."
+            return f"Error: LM Studio returned status code {response.status_code}"
             
-    except requests.exceptions.RequestException:
-        return "Maaf, tidak dapat terhubung ke AI model. Pastikan LM Studio berjalan."
+    except requests.exceptions.RequestException as e:
+        return f"Error connecting to LM Studio: {str(e)}"
 
-def is_relevant_question(question: str) -> bool:
-    """Check if question is relevant to papers or UNNES"""
-    relevant_keywords = [
-        'paper', 'penelitian', 'skripsi', 'jurnal', 'artikel', 'study', 'research',
-        'unnes', 'universitas negeri semarang', 'semarang', 'metode', 'metodologi',
-        'hasil', 'kesimpulan', 'analisis', 'pembahasan', 'teori', 'landasan',
-        'penulis', 'author', 'tahun', 'publikasi', 'abstrak', 'abstract'
-    ]
-    
-    question_lower = question.lower()
-    return any(keyword in question_lower for keyword in relevant_keywords)
+# Routes
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-# API Endpoints
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    
+    if not data or not all(k in data for k in ('username', 'email', 'password')):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    # Check if user already exists
+    if User.query.filter_by(username=data['username']).first():
+        return jsonify({'error': 'Username already exists'}), 400
+    
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({'error': 'Email already exists'}), 400
+    
+    # Create new user
+    user = User(
+        username=data['username'],
+        email=data['email'],
+        role=data.get('role', 'user')  # Default to 'user' if role not specified
+    )
+    user.set_password(data['password'])
+    
+    db.session.add(user)
+    db.session.commit()
+    
+    return jsonify({'message': 'User registered successfully'}), 201
 
-@app.post("/register", response_model=dict)
-async def register(user: UserCreate):
-    # Validate UNNES email and get role
-    role = validate_unnes_email(user.email)
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
     
-    # Check if username already exists
-    if get_user_by_username(user.username):
-        raise HTTPException(status_code=400, detail="Username already registered")
+    if not data or not all(k in data for k in ('username', 'password')):
+        return jsonify({'error': 'Missing username or password'}), 400
     
-    # Check if email already exists
-    conn = get_db_connection()
-    existing_email = conn.execute('SELECT id FROM users WHERE email = ?', (user.email.lower(),)).fetchone()
-    if existing_email:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User.query.filter_by(username=data['username']).first()
     
-    # Hash password
-    hashed_password = get_password_hash(user.password)
-    
-    # Insert user with determined role
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO users (username, password_hash, email, role) VALUES (?, ?, ?, ?)',
-            (user.username, hashed_password, user.email.lower(), role)
-        )
-        conn.commit()
-        user_id = cursor.lastrowid
-        conn.close()
-        
-        return {
-            "message": "User registered successfully", 
-            "user_id": user_id,
-            "role": role,
-            "email": user.email.lower()
-        }
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+    if user and user.check_password(data['password']):
+        session['user_id'] = user.id
+        session['username'] = user.username
+        session['role'] = user.role
+        return jsonify({
+            'message': 'Login successful',
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'role': user.role
+            }
+        })
+    else:
+        return jsonify({'error': 'Invalid credentials'}), 401
 
-@app.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = get_user_by_username(form_data.username)
-    
-    if not user or not verify_password(form_data.password, user['password_hash']):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    
-    if not user['is_active']:
-        raise HTTPException(status_code=401, detail="Account is deactivated")
-    
-    access_token = create_access_token(data={"sub": user['username']})
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user_info": {
-            "id": user['id'],
-            "username": user['username'],
-            "email": user['email'],
-            "role": user['role']
-        }
-    }
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'message': 'Logged out successfully'})
 
-@app.post("/upload")
-async def upload_documents(
-    files: List[UploadFile] = File(...),
-    current_user = Depends(get_current_user)
-):
+@app.route('/upload', methods=['POST'])
+@login_required
+def upload_files():
+    if 'files' not in request.files:
+        return jsonify({'error': 'No files provided'}), 400
+    
+    files = request.files.getlist('files')
+    
     if len(files) > 5:
-        raise HTTPException(status_code=400, detail="Maximum 5 files allowed")
+        return jsonify({'error': 'Maximum 5 files allowed'}), 400
+    
+    if not files or all(file.filename == '' for file in files):
+        return jsonify({'error': 'No files selected'}), 400
     
     uploaded_files = []
-    conn = get_db_connection()
     
-    try:
-        for file in files:
-            # Read file content
-            file_content = await file.read()
+    for file in files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            # Add timestamp to prevent filename conflicts
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
+            filename = timestamp + filename
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             
-            # Extract text
-            extracted_text = extract_text_from_file(file_content, file.filename)
+            file.save(file_path)
             
-            # Generate unique document ID
-            doc_id = str(uuid.uuid4())
-            
-            # Save file
-            file_path = f"uploads/{doc_id}_{file.filename}"
-            with open(file_path, "wb") as f:
-                f.write(file_content)
+            # Extract text content
+            content = extract_text_from_file(file_path, file.filename)
             
             # Save to database
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO documents (id, user_id, filename, file_path, file_size, content_text)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (doc_id, current_user['id'], file.filename, file_path, len(file_content), extracted_text))
+            document = Document(
+                filename=filename,
+                original_filename=file.filename,
+                file_path=file_path,
+                content=content,
+                user_id=session['user_id']
+            )
+            db.session.add(document)
+            db.session.commit()
             
             uploaded_files.append({
-                "document_id": doc_id,
-                "filename": file.filename,
-                "size": len(file_content)
+                'id': document.id,
+                'filename': file.filename,
+                'size': len(content)
             })
-        
-        conn.commit()
-        conn.close()
-        
-        return {"message": "Files uploaded successfully", "documents": uploaded_files}
-        
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    
+    return jsonify({
+        'message': f'{len(uploaded_files)} files uploaded successfully',
+        'files': uploaded_files
+    })
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(
-    chat_request: ChatMessage,
-    current_user = Depends(get_current_user)
-):
-    # Check if question is relevant
-    if not is_relevant_question(chat_request.message):
-        return ChatResponse(
-            response="Maaf, tolong berikan pertanyaan yang relevan dengan paper atau Universitas Negeri Semarang.",
-            session_id=chat_request.session_id or str(uuid.uuid4()),
-            message_id=0
-        )
-    
-    # Get document context
-    context = ""
-    if chat_request.document_ids:
-        conn = get_db_connection()
-        for doc_id in chat_request.document_ids:
-            doc = conn.execute(
-                'SELECT content_text FROM documents WHERE id = ? AND user_id = ?',
-                (doc_id, current_user['id'])
-            ).fetchone()
-            if doc:
-                context += doc['content_text'] + "\n\n"
-        conn.close()
-    
-    # Get AI response
-    ai_response = query_lm_studio(chat_request.message, context)
-    
-    # Create or use existing session
-    session_id = chat_request.session_id or str(uuid.uuid4())
-    
-    # Save chat message
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Create session if new
-    if not chat_request.session_id:
-        cursor.execute(
-            'INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)',
-            (session_id, current_user['id'], chat_request.message[:50] + "...")
-        )
-    
-    # Save message
-    cursor.execute('''
-        INSERT INTO chat_messages (session_id, user_id, message, response, document_ids)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (session_id, current_user['id'], chat_request.message, ai_response, 
-          json.dumps(chat_request.document_ids) if chat_request.document_ids else None))
-    
-    message_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    return ChatResponse(
-        response=ai_response,
-        session_id=session_id,
-        message_id=message_id
-    )
-
-@app.get("/documents")
-async def get_user_documents(current_user = Depends(get_current_user)):
-    conn = get_db_connection()
-    documents = conn.execute('''
-        SELECT id, filename, file_size, upload_date 
-        FROM documents 
-        WHERE user_id = ? 
-        ORDER BY upload_date DESC
-    ''', (current_user['id'],)).fetchall()
-    conn.close()
-    
-    return [dict(doc) for doc in documents]
-
-@app.get("/chat-history")
-async def get_chat_history(current_user = Depends(get_current_user)):
-    conn = get_db_connection()
-    sessions = conn.execute('''
-        SELECT id, title, created_at 
-        FROM chat_sessions 
-        WHERE user_id = ? 
-        ORDER BY created_at DESC
-    ''', (current_user['id'],)).fetchall()
-    conn.close()
-    
-    return [dict(session) for session in sessions]
-
-@app.get("/chat-messages/{session_id}")
-async def get_chat_messages(session_id: str, current_user = Depends(get_current_user)):
-    conn = get_db_connection()
-    messages = conn.execute('''
-        SELECT message, response, timestamp 
-        FROM chat_messages 
-        WHERE session_id = ? AND user_id = ? 
-        ORDER BY timestamp ASC
-    ''', (session_id, current_user['id'])).fetchall()
-    conn.close()
-    
-    return [dict(message) for message in messages]
-
-# Admin endpoints (Only Admin)
-@app.get("/admin/users", response_model=List[UserResponse])
-async def get_all_users(admin_user = Depends(get_admin_user)):
-    conn = get_db_connection()
-    users = conn.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
-    conn.close()
-    
-    return [UserResponse(**dict(user)) for user in users]
-
-# Dosen can also view users (but limited actions)
-@app.get("/dosen/users", response_model=List[UserResponse])
-async def get_users_for_dosen(dosen_user = Depends(get_admin_or_dosen_user)):
-    conn = get_db_connection()
-    # Dosen can only see mahasiswa
-    if dosen_user['role'] == 'dosen':
-        users = conn.execute('SELECT * FROM users WHERE role = "mahasiswa" ORDER BY created_at DESC').fetchall()
-    else:  # admin
-        users = conn.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
-    conn.close()
-    
-    return [UserResponse(**dict(user)) for user in users]
-
-@app.put("/admin/users/{user_id}")
-async def update_user(
-    user_id: int,
-    update_data: AdminUserUpdate,
-    admin_user = Depends(get_admin_user)
-):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Build update query dynamically
-    updates = []
-    params = []
-    
-    if update_data.is_active is not None:
-        updates.append("is_active = ?")
-        params.append(update_data.is_active)
-    
-    if update_data.role is not None:
-        updates.append("role = ?")
-        params.append(update_data.role)
-    
-    if updates:
-        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
-        params.append(user_id)
-        cursor.execute(query, params)
-        
-        # Log admin action
-        cursor.execute('''
-            INSERT INTO admin_logs (admin_id, action, target_user_id, details)
-            VALUES (?, ?, ?, ?)
-        ''', (admin_user['id'], "UPDATE_USER", user_id, json.dumps(update_data.dict())))
-        
-        conn.commit()
-    
-    conn.close()
-    return {"message": "User updated successfully"}
-
-@app.delete("/admin/users/{user_id}")
-async def delete_user(user_id: int, admin_user = Depends(get_admin_user)):
-    if user_id == admin_user['id']:
-        raise HTTPException(status_code=400, detail="Cannot delete your own account")
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Delete user and related data
-    cursor.execute('DELETE FROM chat_messages WHERE user_id = ?', (user_id,))
-    cursor.execute('DELETE FROM chat_sessions WHERE user_id = ?', (user_id,))
-    cursor.execute('DELETE FROM documents WHERE user_id = ?', (user_id,))
-    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-    
-    # Log admin action
-    cursor.execute('''
-        INSERT INTO admin_logs (admin_id, action, target_user_id, details)
-        VALUES (?, ?, ?, ?)
-    ''', (admin_user['id'], "DELETE_USER", user_id, f"Deleted user ID {user_id}"))
-    
-    conn.commit()
-    conn.close()
-    
-    return {"message": "User deleted successfully"}
-
-@app.get("/admin/stats")
-async def get_admin_stats(admin_user = Depends(get_admin_user)):
-    conn = get_db_connection()
-    
-    # Get various statistics
-    total_users = conn.execute('SELECT COUNT(*) as count FROM users').fetchone()['count']
-    total_mahasiswa = conn.execute('SELECT COUNT(*) as count FROM users WHERE role = "mahasiswa"').fetchone()['count']
-    total_dosen = conn.execute('SELECT COUNT(*) as count FROM users WHERE role = "dosen"').fetchone()['count']
-    total_documents = conn.execute('SELECT COUNT(*) as count FROM documents').fetchone()['count']
-    total_chats = conn.execute('SELECT COUNT(*) as count FROM chat_messages').fetchone()['count']
-    active_users = conn.execute('SELECT COUNT(*) as count FROM users WHERE is_active = 1').fetchone()['count']
-    
-    conn.close()
-    
-    return {
-        "total_users": total_users,
-        "total_mahasiswa": total_mahasiswa,
-        "total_dosen": total_dosen,
-        "active_users": active_users,
-        "total_documents": total_documents,
-        "total_chat_messages": total_chats
-    }
-
-@app.get("/predefined-questions")
-async def get_predefined_questions():
-    """Get list of predefined questions"""
+@app.route('/predefined-questions', methods=['GET'])
+def get_predefined_questions():
     questions = [
-        "Apa metode penelitian yang digunakan dalam paper ini?",
-        "Siapa penulis dan kapan paper ini dibuat?",
-        "Apa hasil utama dari penelitian ini?",
-        "Apa kesimpulan dari paper ini?",
-        "Apa landasan teori yang digunakan?",
-        "Bagaimana metodologi yang diterapkan?",
-        "Apa saja temuan penting dalam penelitian ini?",
-        "Bagaimana analisis data dilakukan?",
-        "Apa kontribusi penelitian ini terhadap ilmu pengetahuan?",
-        "Apa saran untuk penelitian selanjutnya?",
-        "Bagaimana cara mendaftar di UNNES?",
-        "Apa saja fakultas yang ada di UNNES?",
-        "Bagaimana sistem perkuliahan di UNNES?",
-        "Apa visi misi UNNES?"
+        "Metode apa yang digunakan pada paper tersebut?",
+        "Siapa penulis dan kapan paper tersebut dibuat?",
+        "Apa hasil dari paper tersebut?",
+        "Apa kesimpulan dari penelitian ini?",
+        "Apa tujuan dari penelitian ini?",
+        "Apa kontribusi utama dari paper ini?",
+        "Apa keterbatasan dari penelitian ini?",
+        "Bagaimana metodologi penelitian yang digunakan?"
     ]
-    return {"questions": questions}
+    return jsonify({'questions': questions})
 
-@app.get("/profile")
-async def get_user_profile(current_user = Depends(get_current_user)):
-    """Get current user profile information"""
-    return {
-        "id": current_user['id'],
-        "username": current_user['username'],
-        "email": current_user['email'],
-        "role": current_user['role'],
-        "created_at": current_user['created_at'],
-        "is_active": current_user['is_active']
-    }
+@app.route('/ask', methods=['POST'])
+@login_required
+def ask_question():
+    data = request.get_json()
+    
+    if not data or 'question' not in data:
+        return jsonify({'error': 'Question is required'}), 400
+    
+    question = data['question']
+    document_ids = data.get('document_ids', [])
+    
+    # Check if question is relevant
+    if not is_relevant_query(question):
+        response = "Maaf, tolong berikan pertanyaan yang relevan dengan paper atau universitas negeri semarang"
+        
+        # Save to chat history
+        chat_history = ChatHistory(
+            user_id=session['user_id'],
+            session_id=session.get('session_id', 'default'),
+            message=question,
+            response=response,
+            document_ids=','.join(map(str, document_ids)) if document_ids else None
+        )
+        db.session.add(chat_history)
+        db.session.commit()
+        
+        return jsonify({'response': response})
+    
+    # Get document contents
+    documents_content = ""
+    if document_ids:
+        documents = Document.query.filter(
+            Document.id.in_(document_ids),
+            Document.user_id == session['user_id']
+        ).all()
+        
+        documents_content = "\n\n".join([
+            f"Document: {doc.original_filename}\nContent: {doc.content[:2000]}..."
+            for doc in documents
+        ])
+    
+    # Prepare messages for LM Studio
+    system_prompt = """Anda adalah asisten AI yang membantu menganalisis dokumen akademik, khususnya paper penelitian dan informasi tentang Universitas Negeri Semarang (UNNES). 
+    
+Tugas Anda:
+1. Berikan jawaban yang akurat dan informatif berdasarkan dokumen yang diberikan
+2. Fokus pada aspek akademik dan penelitian
+3. Jika ditanya tentang UNNES, berikan informasi yang relevan
+4. Berikan jawaban dalam bahasa Indonesia yang jelas dan mudah dipahami
 
-@app.get("/role-info")
-async def get_role_info():
-    """Get information about different roles in the system"""
-    return {
-        "roles": {
-            "mahasiswa": {
-                "description": "Mahasiswa UNNES",
-                "email_domain": "@students.unnes.ac.id",
-                "permissions": [
-                    "Upload dokumen penelitian",
-                    "Chat dengan AI tentang paper/UNNES", 
-                    "Melihat riwayat chat sendiri",
-                    "Mengelola dokumen sendiri"
-                ]
-            },
-            "dosen": {
-                "description": "Dosen UNNES",
-                "email_domain": "@mail.unnes.ac.id", 
-                "permissions": [
-                    "Semua fitur mahasiswa",
-                    "Melihat daftar mahasiswa",
-                    "Akses ke statistik terbatas"
-                ]
-            },
-            "admin": {
-                "description": "Administrator Sistem",
-                "email_domain": "@mail.unnes.ac.id",
-                "permissions": [
-                    "Semua fitur sistem",
-                    "Mengelola semua user",
-                    "Melihat statistik lengkap",
-                    "Mengaktifkan/menonaktifkan akun",
-                    "Menghapus user dan data"
-                ]
-            }
-        }
-    }
+Konteks dokumen:"""
+    
+    if documents_content:
+        system_prompt += f"\n\n{documents_content}"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question}
+    ]
+    
+    # Get previous chat history for context
+    recent_chats = ChatHistory.query.filter_by(
+        user_id=session['user_id']
+    ).order_by(ChatHistory.timestamp.desc()).limit(3).all()
+    
+    # Add recent context
+    for chat in reversed(recent_chats):
+        messages.insert(-1, {"role": "user", "content": chat.message})
+        messages.insert(-1, {"role": "assistant", "content": chat.response})
+    
+    # Query LM Studio
+    response = query_lm_studio(messages)
+    
+    # Save to chat history
+    chat_history = ChatHistory(
+        user_id=session['user_id'],
+        session_id=session.get('session_id', 'default'),
+        message=question,
+        response=response,
+        document_ids=','.join(map(str, document_ids)) if document_ids else None
+    )
+    db.session.add(chat_history)
+    db.session.commit()
+    
+    return jsonify({'response': response})
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.route('/chat-history', methods=['GET'])
+@login_required
+def get_chat_history():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    
+    chats = ChatHistory.query.filter_by(
+        user_id=session['user_id']
+    ).order_by(ChatHistory.timestamp.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    
+    return jsonify({
+        'chats': [{
+            'id': chat.id,
+            'message': chat.message,
+            'response': chat.response,
+            'timestamp': chat.timestamp.isoformat()
+        } for chat in chats.items],
+        'has_more': chats.has_next,
+        'total': chats.total
+    })
+
+@app.route('/documents', methods=['GET'])
+@login_required
+def get_user_documents():
+    documents = Document.query.filter_by(user_id=session['user_id']).all()
+    
+    return jsonify({
+        'documents': [{
+            'id': doc.id,
+            'filename': doc.original_filename,
+            'uploaded_at': doc.uploaded_at.isoformat(),
+            'content_preview': doc.content[:200] + '...' if len(doc.content) > 200 else doc.content
+        } for doc in documents]
+    })
+
+# Admin Routes
+@app.route('/admin/users', methods=['GET'])
+@admin_required
+def get_all_users():
+    users = User.query.all()
+    return jsonify({
+        'users': [{
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'role': user.role,
+            'created_at': user.created_at.isoformat()
+        } for user in users]
+    })
+
+@app.route('/admin/documents', methods=['GET'])
+@admin_or_dosen_required
+def get_all_documents():
+    documents = Document.query.join(User).all()
+    
+    return jsonify({
+        'documents': [{
+            'id': doc.id,
+            'filename': doc.original_filename,
+            'username': doc.user.username,
+            'uploaded_at': doc.uploaded_at.isoformat(),
+            'content_preview': doc.content[:200] + '...' if len(doc.content) > 200 else doc.content
+        } for doc in documents]
+    })
+
+@app.route('/admin/chat-history', methods=['GET'])
+@admin_or_dosen_required
+def get_all_chat_history():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    
+    chats = ChatHistory.query.join(User).order_by(
+        ChatHistory.timestamp.desc()
+    ).paginate(page=page, per_page=per_page, error_out=False)
+    
+    return jsonify({
+        'chats': [{
+            'id': chat.id,
+            'username': chat.user.username,
+            'message': chat.message,
+            'response': chat.response,
+            'timestamp': chat.timestamp.isoformat()
+        } for chat in chats.items],
+        'has_more': chats.has_next,
+        'total': chats.total
+    })
+
+@app.route('/admin/update-user-role', methods=['POST'])
+@admin_required
+def update_user_role():
+    data = request.get_json()
+    
+    if not data or not all(k in data for k in ('user_id', 'role')):
+        return jsonify({'error': 'User ID and role are required'}), 400
+    
+    if data['role'] not in ['user', 'admin', 'dosen']:
+        return jsonify({'error': 'Invalid role'}), 400
+    
+    user = User.query.get(data['user_id'])
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    user.role = data['role']
+    db.session.commit()
+    
+    return jsonify({'message': 'User role updated successfully'})
+
+@app.route('/admin/delete-user', methods=['DELETE'])
+@admin_required
+def delete_user():
+    user_id = request.args.get('user_id', type=int)
+    
+    if not user_id:
+        return jsonify({'error': 'User ID is required'}), 400
+    
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    # Don't allow deleting the current admin
+    if user.id == session['user_id']:
+        return jsonify({'error': 'Cannot delete your own account'}), 400
+    
+    # Delete related data
+    ChatHistory.query.filter_by(user_id=user_id).delete()
+    Document.query.filter_by(user_id=user_id).delete()
+    
+    db.session.delete(user)
+    db.session.commit()
+    
+    return jsonify({'message': 'User deleted successfully'})
+
+@app.route('/user-info', methods=['GET'])
+@login_required
+def get_user_info():
+    user = User.query.get(session['user_id'])
+    return jsonify({
+        'id': user.id,
+        'username': user.username,
+        'email': user.email,
+        'role': user.role,
+        'created_at': user.created_at.isoformat()
+    })
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        
+        # Create default admin user if not exists
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin = User(username='admin', email='admin@unnes.ac.id', role='admin')
+            admin.set_password('admin123')
+            db.session.add(admin)
+            db.session.commit()
+            print("Default admin user created - username: admin, password: admin123")
+    
+    app.run(debug=True)
